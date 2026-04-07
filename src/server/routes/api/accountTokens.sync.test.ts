@@ -11,6 +11,8 @@ const getApiTokenMock = vi.fn();
 const createApiTokenMock = vi.fn();
 const getUserGroupsMock = vi.fn();
 const deleteApiTokenMock = vi.fn();
+const getModelsMock = vi.fn();
+const discoverCodexModelsFromCloudMock = vi.fn();
 
 type AccountTokenServiceModule = typeof import('../../services/accountTokenService.js');
 
@@ -21,7 +23,15 @@ vi.mock('../../services/platforms/index.js', () => ({
     createApiToken: (...args: unknown[]) => createApiTokenMock(...args),
     getUserGroups: (...args: unknown[]) => getUserGroupsMock(...args),
     deleteApiToken: (...args: unknown[]) => deleteApiTokenMock(...args),
+    getModels: (...args: unknown[]) => getModelsMock(...args),
   }),
+}));
+
+vi.mock('../../services/platformDiscoveryRegistry.js', () => ({
+  discoverCodexModelsFromCloud: (...args: unknown[]) => discoverCodexModelsFromCloudMock(...args),
+  discoverClaudeModelsFromCloud: vi.fn(),
+  discoverAntigravityModelsFromCloud: vi.fn(),
+  validateGeminiCliOauthConnection: vi.fn(),
 }));
 
 type DbModule = typeof import('../../db/index.js');
@@ -39,12 +49,22 @@ describe('account tokens sync routes with site status', () => {
     return seedId;
   };
 
-  const seedAccount = async (input: { siteStatus?: 'active' | 'disabled'; accountStatus?: string; accessToken?: string | null }) => {
+  const seedAccount = async (input: {
+    siteStatus?: 'active' | 'disabled';
+    sitePlatform?: string;
+    siteUrl?: string;
+    accountStatus?: string;
+    accessToken?: string | null;
+    apiToken?: string | null;
+    oauthProvider?: string | null;
+    oauthAccountKey?: string | null;
+    extraConfig?: string | Record<string, unknown> | null;
+  }) => {
     const id = nextSeed();
     const site = await db.insert(schema.sites).values({
       name: `site-${id}`,
-      url: `https://site-${id}.example.com`,
-      platform: 'new-api',
+      url: input.siteUrl ?? `https://site-${id}.example.com`,
+      platform: input.sitePlatform ?? 'new-api',
     }).returning().get();
     if (input.siteStatus === 'disabled') {
       await db.run(sql`update sites set status = 'disabled' where id = ${site.id}`);
@@ -54,7 +74,11 @@ describe('account tokens sync routes with site status', () => {
       siteId: site.id,
       username: `user-${id}`,
       accessToken: input.accessToken ?? `access-token-${id}`,
+      apiToken: input.apiToken ?? null,
       status: input.accountStatus ?? 'active',
+      oauthProvider: input.oauthProvider ?? null,
+      oauthAccountKey: input.oauthAccountKey ?? null,
+      extraConfig: input.extraConfig ?? null,
     }).returning().get();
 
     return { site, account };
@@ -82,6 +106,8 @@ describe('account tokens sync routes with site status', () => {
     createApiTokenMock.mockReset();
     getUserGroupsMock.mockReset();
     deleteApiTokenMock.mockReset();
+    getModelsMock.mockReset();
+    discoverCodexModelsFromCloudMock.mockReset();
     seedId = 0;
 
     await db.delete(schema.accountTokens).run();
@@ -141,6 +167,44 @@ describe('account tokens sync routes with site status', () => {
       .where(eq(schema.accountTokens.accountId, account.id))
       .all();
     expect(tokenRows.length).toBe(0);
+  });
+
+  it('treats oauth direct accounts as synced without calling upstream token management', async () => {
+    const { account } = await seedAccount({
+      siteStatus: 'active',
+      sitePlatform: 'codex',
+      siteUrl: 'https://chatgpt.com/backend-api/codex',
+      oauthProvider: 'codex',
+      oauthAccountKey: 'chatgpt-account-direct-sync',
+      extraConfig: mergeAccountExtraConfig(null, {
+        credentialMode: 'session',
+        oauth: {
+          provider: 'codex',
+          accountId: 'chatgpt-account-direct-sync',
+          email: 'oauth-direct@example.com',
+        },
+      }),
+    });
+
+    discoverCodexModelsFromCloudMock.mockResolvedValue(['gpt-5.4']);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/account-tokens/sync/${account.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      success: true,
+      synced: true,
+      status: 'synced',
+      reason: 'oauth_direct_routing',
+      created: 0,
+      updated: 0,
+      total: 0,
+    });
+    expect(getApiTokensMock).not.toHaveBeenCalled();
+    expect(getApiTokenMock).not.toHaveBeenCalled();
   });
 
   it('stores masked upstream token values as masked_pending placeholders', async () => {
@@ -572,6 +636,52 @@ describe('account tokens sync routes with site status', () => {
     expect(syncedDefaultToken?.token).toBe('sk-synced-token');
   });
 
+  it('sync-all counts oauth direct accounts as synced so they stay in coverage refresh', async () => {
+    await seedAccount({
+      siteStatus: 'active',
+      sitePlatform: 'codex',
+      siteUrl: 'https://chatgpt.com/backend-api/codex',
+      oauthProvider: 'codex',
+      oauthAccountKey: 'chatgpt-account-sync-all',
+      extraConfig: mergeAccountExtraConfig(null, {
+        credentialMode: 'session',
+        oauth: {
+          provider: 'codex',
+          accountId: 'chatgpt-account-sync-all',
+          email: 'oauth-sync-all@example.com',
+        },
+      }),
+    });
+
+    discoverCodexModelsFromCloudMock.mockResolvedValue(['gpt-5.4']);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/account-tokens/sync-all',
+      payload: { wait: true },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      success: true,
+      summary: {
+        total: 1,
+        synced: 1,
+        skipped: 0,
+        failed: 0,
+      },
+      results: [
+        expect.objectContaining({
+          status: 'synced',
+          reason: 'oauth_direct_routing',
+          synced: true,
+        }),
+      ],
+    });
+    expect(getApiTokensMock).not.toHaveBeenCalled();
+    expect(getApiTokenMock).not.toHaveBeenCalled();
+  });
+
   it('rejects non-boolean wait when syncing all account tokens', async () => {
     const response = await app.inject({
       method: 'POST',
@@ -648,6 +758,46 @@ describe('account tokens sync routes with site status', () => {
     expect(tokenRows[0].name).toBe('created-from-upstream');
     expect(tokenRows[0].token).toBe('sk-created-upstream-token');
     expect(tokenRows[0].source).toBe('sync');
+  });
+
+  it('refreshes oauth direct routing instead of creating an upstream token', async () => {
+    const { account } = await seedAccount({
+      siteStatus: 'active',
+      sitePlatform: 'codex',
+      siteUrl: 'https://chatgpt.com/backend-api/codex',
+      oauthProvider: 'codex',
+      oauthAccountKey: 'chatgpt-account-create-direct',
+      extraConfig: mergeAccountExtraConfig(null, {
+        credentialMode: 'session',
+        oauth: {
+          provider: 'codex',
+          accountId: 'chatgpt-account-create-direct',
+          email: 'oauth-create@example.com',
+        },
+      }),
+    });
+
+    discoverCodexModelsFromCloudMock.mockResolvedValue(['gpt-5.4']);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/account-tokens',
+      payload: {
+        accountId: account.id,
+        name: 'ignored-for-oauth-direct',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      success: true,
+      createdViaUpstream: false,
+      directRoutingRefreshed: true,
+      token: null,
+      message: expect.stringContaining('无需创建站点令牌'),
+    });
+    expect(createApiTokenMock).not.toHaveBeenCalled();
+    expect(getApiTokensMock).not.toHaveBeenCalled();
   });
 
   it('passes token creation options to upstream adapter', async () => {

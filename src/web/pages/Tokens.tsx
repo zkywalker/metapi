@@ -602,7 +602,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
       const remainQuota = form.unlimitedQuota
         ? undefined
         : Number.parseInt(form.remainQuota, 10);
-      await api.addAccountToken({
+      const result = await api.addAccountToken({
         accountId: form.accountId,
         name: form.name,
         group: form.group || 'default',
@@ -611,7 +611,11 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
         expiredTime: form.expiredTime || undefined,
         allowIps: form.allowIps,
       });
-      toast.success('已在站点创建并同步令牌');
+      if (result?.directRoutingRefreshed) {
+        toast.success(result.message || 'OAuth 直连账号已刷新模型与路由');
+      } else {
+        toast.success('已在站点创建并同步令牌');
+      }
       setForm(initialCreateForm);
       setShowAdd(false);
       setCreateHintModelName('');

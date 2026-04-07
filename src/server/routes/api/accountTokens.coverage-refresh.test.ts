@@ -11,6 +11,7 @@ const createApiTokenMock = vi.fn();
 const getUserGroupsMock = vi.fn();
 const deleteApiTokenMock = vi.fn();
 const getModelsMock = vi.fn();
+const discoverCodexModelsFromCloudMock = vi.fn();
 
 vi.mock('../../services/platforms/index.js', () => ({
   getAdapter: () => ({
@@ -21,6 +22,13 @@ vi.mock('../../services/platforms/index.js', () => ({
     deleteApiToken: (...args: unknown[]) => deleteApiTokenMock(...args),
     getModels: (...args: unknown[]) => getModelsMock(...args),
   }),
+}));
+
+vi.mock('../../services/platformDiscoveryRegistry.js', () => ({
+  discoverCodexModelsFromCloud: (...args: unknown[]) => discoverCodexModelsFromCloudMock(...args),
+  discoverClaudeModelsFromCloud: vi.fn(),
+  discoverAntigravityModelsFromCloud: vi.fn(),
+  validateGeminiCliOauthConnection: vi.fn(),
 }));
 
 type DbModule = typeof import('../../db/index.js');
@@ -37,12 +45,21 @@ describe('account token coverage refresh', { timeout: 15_000 }, () => {
     return seedId;
   };
 
-  const seedAccount = async (modelName: string) => {
+  const seedAccount = async (
+    modelName: string,
+    options: {
+      sitePlatform?: string;
+      siteUrl?: string;
+      oauthProvider?: string | null;
+      oauthAccountKey?: string | null;
+      extraConfig?: string | Record<string, unknown> | null;
+    } = {},
+  ) => {
     const id = nextSeed();
     const site = await db.insert(schema.sites).values({
       name: `site-${id}`,
-      url: `https://site-${id}.example.com`,
-      platform: 'new-api',
+      url: options.siteUrl ?? `https://site-${id}.example.com`,
+      platform: options.sitePlatform ?? 'new-api',
       status: 'active',
     }).returning().get();
 
@@ -51,6 +68,9 @@ describe('account token coverage refresh', { timeout: 15_000 }, () => {
       username: `user-${id}`,
       accessToken: `acc-token-${id}`,
       status: 'active',
+      oauthProvider: options.oauthProvider ?? null,
+      oauthAccountKey: options.oauthAccountKey ?? null,
+      extraConfig: options.extraConfig ?? null,
     }).returning().get();
 
     await db.insert(schema.modelAvailability).values({
@@ -97,6 +117,7 @@ describe('account token coverage refresh', { timeout: 15_000 }, () => {
     getUserGroupsMock.mockReset();
     deleteApiTokenMock.mockReset();
     getModelsMock.mockReset();
+    discoverCodexModelsFromCloudMock.mockReset();
     seedId = 0;
 
     await db.delete(schema.proxyLogs).run();
@@ -199,5 +220,57 @@ describe('account token coverage refresh', { timeout: 15_000 }, () => {
         tokenId: token!.id,
       }),
     ]);
+  });
+
+  it('refreshes direct oauth route coverage without creating a managed token', async () => {
+    const modelName = 'gpt-5.4';
+    const { account } = await seedAccount(
+      modelName,
+      {
+        sitePlatform: 'codex',
+        siteUrl: 'https://chatgpt.com/backend-api/codex',
+        oauthProvider: 'codex',
+        oauthAccountKey: 'chatgpt-account-coverage-direct',
+        extraConfig: JSON.stringify({
+          credentialMode: 'session',
+          oauth: {
+            provider: 'codex',
+            accountId: 'chatgpt-account-coverage-direct',
+            email: 'coverage-direct@example.com',
+          },
+        }),
+      },
+    );
+
+    await db.delete(schema.modelAvailability)
+      .where(eq(schema.modelAvailability.accountId, account.id))
+      .run();
+
+    discoverCodexModelsFromCloudMock.mockResolvedValue([modelName]);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/account-tokens',
+      payload: {
+        accountId: account.id,
+        name: 'ignored-for-direct-oauth',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      success: true,
+      directRoutingRefreshed: true,
+      token: null,
+      coverageRefresh: {
+        rebuild: expect.objectContaining({ success: true }),
+      },
+    });
+
+    const refreshedModels = await db.select()
+      .from(schema.modelAvailability)
+      .where(eq(schema.modelAvailability.accountId, account.id))
+      .all();
+    expect(refreshedModels.map((row) => row.modelName)).toContain(modelName);
   });
 });

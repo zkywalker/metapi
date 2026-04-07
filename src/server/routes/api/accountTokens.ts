@@ -16,10 +16,16 @@ import {
   setDefaultToken,
 } from '../../services/accountTokenService.js';
 import { getAdapter } from '../../services/platforms/index.js';
-import { getCredentialModeFromExtraConfig, getProxyUrlFromExtraConfig, resolvePlatformUserId } from '../../services/accountExtraConfig.js';
+import {
+  getCredentialModeFromExtraConfig,
+  getProxyUrlFromExtraConfig,
+  resolvePlatformUserId,
+  supportsDirectAccountRoutingConnection,
+} from '../../services/accountExtraConfig.js';
 import { startBackgroundTask } from '../../services/backgroundTaskService.js';
 import { withAccountProxyOverride } from '../../services/siteProxy.js';
 import { type ModelRefreshResult } from '../../services/modelService.js';
+import { getOauthInfoFromAccount } from '../../services/oauth/oauthAccount.js';
 import {
   type CoverageBatchRebuildResult,
   convergeAccountMutation,
@@ -123,6 +129,10 @@ function isApiKeyConnection(account: typeof schema.accounts.$inferSelect): boole
   const explicit = getCredentialModeFromExtraConfig(account.extraConfig);
   if (explicit && explicit !== 'auto') return explicit === 'apikey';
   return !(account.accessToken || '').trim();
+}
+
+function isOauthDirectRoutingConnection(account: typeof schema.accounts.$inferSelect): boolean {
+  return !!getOauthInfoFromAccount(account) && supportsDirectAccountRoutingConnection(account);
 }
 
 function asTrimmedString(value: unknown): string | undefined {
@@ -273,6 +283,20 @@ async function executeAccountTokenSync(row: AccountWithSiteRow): Promise<SyncExe
       status: 'skipped',
       reason: 'missing_access_token',
       synced: false,
+      created: 0,
+      updated: 0,
+      total: 0,
+      defaultTokenId: null,
+    };
+  }
+
+  if (isOauthDirectRoutingConnection(row.accounts)) {
+    return {
+      ...base,
+      status: 'synced',
+      reason: 'oauth_direct_routing',
+      message: 'oauth direct routing uses model coverage instead of managed account tokens',
+      synced: true,
       created: 0,
       updated: 0,
       total: 0,
@@ -553,6 +577,18 @@ export async function accountTokensRoutes(app: FastifyInstance) {
 
     if (!account.accessToken?.trim()) {
       return reply.code(400).send({ success: false, message: '账号缺少访问令牌，无法创建站点令牌' });
+    }
+
+    if (isOauthDirectRoutingConnection(account)) {
+      const coverageRefresh = await refreshCoverageForAccounts([account.id]);
+      return {
+        success: true,
+        createdViaUpstream: false,
+        directRoutingRefreshed: true,
+        message: 'OAuth 直连账号无需创建站点令牌，已刷新模型与路由',
+        coverageRefresh,
+        token: null,
+      };
     }
 
     const adapter = getAdapter(site.platform);
