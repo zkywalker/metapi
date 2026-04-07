@@ -787,6 +787,183 @@ describe('downstream api keys routes', () => {
     expect(trendBody.buckets.some((bucket: any) => bucket.totalTokens === 900)).toBe(true);
   });
 
+  it('returns public key usage lookup with model aggregates and recent requests', async () => {
+    const inserted = await db.insert(schema.downstreamApiKeys).values({
+      name: 'public-usage-key',
+      key: 'sk-public-usage-key-001',
+      enabled: true,
+      description: 'public lookup',
+      usedCost: 1.23,
+      usedRequests: 12,
+      tags: JSON.stringify(['公开查询']),
+      supportedModels: JSON.stringify(['gpt-5.2', 'claude-3-7-sonnet']),
+    }).returning().get();
+
+    const now = Date.now();
+    const within24h = new Date(now - 3 * 60 * 60 * 1000).toISOString();
+    const within7d = new Date(now - 3 * 24 * 60 * 60 * 1000).toISOString();
+
+    await db.insert(schema.proxyLogs).values([
+      {
+        downstreamApiKeyId: inserted.id,
+        status: 'success',
+        httpStatus: 200,
+        isStream: true,
+        retryCount: 0,
+        modelRequested: 'gpt-5.2',
+        modelActual: 'gpt-5.2',
+        promptTokens: 100,
+        completionTokens: 50,
+        totalTokens: 150,
+        estimatedCost: 0.015,
+        latencyMs: 1800,
+        firstByteLatencyMs: 220,
+        createdAt: within24h,
+      },
+      {
+        downstreamApiKeyId: inserted.id,
+        status: 'failed',
+        httpStatus: 429,
+        isStream: false,
+        retryCount: 1,
+        modelRequested: 'gpt-5.2',
+        modelActual: null,
+        promptTokens: 40,
+        completionTokens: 0,
+        totalTokens: 40,
+        estimatedCost: 0.004,
+        latencyMs: 900,
+        firstByteLatencyMs: 120,
+        errorMessage: 'rate limited',
+        createdAt: within24h,
+      },
+      {
+        downstreamApiKeyId: inserted.id,
+        status: 'success',
+        httpStatus: 200,
+        isStream: false,
+        retryCount: 0,
+        modelRequested: 'claude-3-7-sonnet',
+        modelActual: 'claude-3-7-sonnet',
+        promptTokens: 80,
+        completionTokens: 20,
+        totalTokens: 100,
+        estimatedCost: 0.02,
+        latencyMs: 2500,
+        firstByteLatencyMs: 350,
+        createdAt: within7d,
+      },
+    ]).run();
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/public/downstream-key-usage?key=${encodeURIComponent(inserted.key)}`,
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['cache-control']).toBe('no-store');
+    const body = res.json();
+    expect(body).toMatchObject({
+      success: true,
+      item: {
+        id: inserted.id,
+        name: 'public-usage-key',
+        keyMasked: expect.any(String),
+        usedCost: 1.23,
+        usedRequests: 12,
+        tags: ['公开查询'],
+        supportedModels: ['gpt-5.2', 'claude-3-7-sonnet'],
+      },
+      usage: {
+        last24h: {
+          totalRequests: 2,
+          successRequests: 1,
+          failedRequests: 1,
+          promptTokens: 140,
+          completionTokens: 50,
+          totalTokens: 190,
+          totalCost: 0.019,
+        },
+        last7d: {
+          totalRequests: 3,
+          successRequests: 2,
+          failedRequests: 1,
+          promptTokens: 220,
+          completionTokens: 70,
+          totalTokens: 290,
+          totalCost: 0.039,
+        },
+        all: {
+          totalRequests: 3,
+          successRequests: 2,
+          failedRequests: 1,
+          promptTokens: 220,
+          completionTokens: 70,
+          totalTokens: 290,
+          totalCost: 0.039,
+        },
+      },
+      modelUsage: [
+        {
+          model: 'gpt-5.2',
+          totalRequests: 2,
+          successRequests: 1,
+          failedRequests: 1,
+          promptTokens: 140,
+          completionTokens: 50,
+          totalTokens: 190,
+          totalCost: 0.019,
+        },
+        {
+          model: 'claude-3-7-sonnet',
+          totalRequests: 1,
+          successRequests: 1,
+          failedRequests: 0,
+          promptTokens: 80,
+          completionTokens: 20,
+          totalTokens: 100,
+          totalCost: 0.02,
+        },
+      ],
+    });
+    expect(body.recentRequests).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        status: 'success',
+        modelActual: 'gpt-5.2',
+        totalTokens: 150,
+        estimatedCost: 0.015,
+      }),
+      expect.objectContaining({
+        status: 'failed',
+        modelRequested: 'gpt-5.2',
+        errorMessage: 'rate limited',
+        retryCount: 1,
+      }),
+    ]));
+  });
+
+  it('rejects missing and unknown keys for the public usage lookup route', async () => {
+    const missingRes = await app.inject({
+      method: 'GET',
+      url: '/api/public/downstream-key-usage',
+    });
+    expect(missingRes.statusCode).toBe(400);
+    expect(missingRes.json()).toMatchObject({
+      success: false,
+      message: 'key 不能为空',
+    });
+
+    const unknownRes = await app.inject({
+      method: 'GET',
+      url: '/api/public/downstream-key-usage?key=sk-not-found-001',
+    });
+    expect(unknownRes.statusCode).toBe(404);
+    expect(unknownRes.json()).toMatchObject({
+      success: false,
+      message: 'API key 不存在',
+    });
+  });
+
   it('groups all-range trend buckets by local day boundaries', async () => {
     const inserted = await db.insert(schema.downstreamApiKeys).values({
       name: 'local-day-key',

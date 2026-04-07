@@ -9,6 +9,7 @@ import {
   toDownstreamApiKeyPolicyView,
   toPersistenceJson,
 } from '../../services/downstreamApiKeyService.js';
+import { lookupPublicDownstreamApiKeyUsageByKey } from '../../services/downstreamApiKeyUsageLookupService.js';
 import { formatUtcSqlDateTime } from '../../services/localTimeService.js';
 import type { DownstreamExcludedCredentialRef } from '../../services/downstreamPolicyTypes.js';
 import {
@@ -240,6 +241,26 @@ async function validatePolicyReferences(input: {
 }
 
 export async function downstreamApiKeysRoutes(app: FastifyInstance) {
+  app.get<{ Querystring: { key?: string } }>('/api/public/downstream-key-usage', async (request, reply) => {
+    reply.header('Cache-Control', 'no-store');
+
+    const rawKey = typeof request.query?.key === 'string' ? request.query.key : '';
+    const key = rawKey.trim();
+    if (!key) {
+      return reply.code(400).send({ success: false, message: 'key 不能为空' });
+    }
+
+    const usage = await lookupPublicDownstreamApiKeyUsageByKey(key);
+    if (!usage) {
+      return reply.code(404).send({ success: false, message: 'API key 不存在' });
+    }
+
+    return {
+      success: true,
+      ...usage,
+    };
+  });
+
   app.get<{ Querystring: { range?: string; status?: string; search?: string; group?: string; tags?: string | string[]; tagMatch?: string } }>('/api/downstream-keys/summary', async (request) => {
     const range = normalizeDownstreamKeyRange(request.query?.range);
     const status = normalizeDownstreamKeyStatus(request.query?.status);

@@ -3,8 +3,10 @@ import { describe, expect, it } from 'vitest';
 import { isPublicApiRoute, registerDesktopRoutes } from './desktop.js';
 
 describe('desktop server routes', () => {
-  it('marks only the desktop health route as public', () => {
+  it('marks desktop health and public downstream key usage routes as public', () => {
     expect(isPublicApiRoute('/api/desktop/health')).toBe(true);
+    expect(isPublicApiRoute('/api/public/downstream-key-usage')).toBe(true);
+    expect(isPublicApiRoute('/api/public/downstream-key-usage?key=sk-test-001')).toBe(true);
     expect(isPublicApiRoute('/api/stats/dashboard')).toBe(false);
   });
 
